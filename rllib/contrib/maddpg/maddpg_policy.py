@@ -8,6 +8,7 @@ from ray.rllib.utils.error import UnsupportedSpaceException
 from ray.rllib.policy.policy import Policy
 from ray.rllib.policy.tf_policy import TFPolicy
 from ray.rllib.utils import try_import_tf, try_import_tfp
+from ray.rllib.models.tf.tf_action_dist import Deterministic
 
 import logging
 from gym.spaces import Box, Discrete
@@ -49,6 +50,9 @@ class MADDPGTFPolicy(MADDPGPostprocessing, TFPolicy):
         # _____ Initial Configuration
         config = dict(ray.rllib.contrib.maddpg.DEFAULT_CONFIG, **config)
         self.global_step = tf.train.get_or_create_global_step()
+
+        # Create sampling timestep placeholder.
+        self.timestep = tf.placeholder(tf.int32, (), name="timestep")
 
         # FIXME: Get done from info is required since agentwise done is not
         # supported now.
@@ -135,17 +139,21 @@ class MADDPGTFPolicy(MADDPGPostprocessing, TFPolicy):
             getattr(tf.nn, config["critic_hidden_activation"]),
             scope="target_critic")
 
+        target_critic_masked = (1.0 - done_ph) * target_critic[:, 0])
+
         # Build critic loss.
         td_error = tf.subtract(
+            critic[:, 0],
             tf.stop_gradient(
-                rew_ph + (1.0 - done_ph) *
-                (config["gamma"]**config["n_step"]) * target_critic[:, 0]),
-            critic[:, 0])
+                rew_ph + (config["gamma"]**config["n_step"])
+                * target_critic_masked )
+
+        #
         critic_loss = tf.reduce_mean(td_error**2)
 
         # _____ Policy Network
         # Build actor network for t.
-        act_sampler, actor_feature, actor_model, actor_vars = (
+        actor_output, actor_feature, actor_model, actor_vars = (
             self._build_actor_network(
                 obs_ph_n[agent_id],
                 obs_space_n[agent_id],
@@ -154,6 +162,15 @@ class MADDPGTFPolicy(MADDPGPostprocessing, TFPolicy):
                 config["actor_hiddens"],
                 getattr(tf.nn, config["actor_hidden_activation"]),
                 scope="actor"))
+
+        # add exploration noise to the action_sampler:
+        self.exploration = self._create_exploration(act_space, config)
+        explore = tf.placeholder_with_default(True, (), name="is_exploring")
+        # Action outputs
+        with tf.variable_scope("action"):
+            self.output_actions, _ = self.exploration.get_exploration_action(
+                actor_output, Deterministic, actor_model, explore,
+                self.timestep)
 
         # Build actor network for t + 1.
         self.new_obs_ph = new_obs_ph_n[agent_id]
@@ -167,9 +184,8 @@ class MADDPGTFPolicy(MADDPGPostprocessing, TFPolicy):
                 getattr(tf.nn, config["actor_hidden_activation"]),
                 scope="target_actor"))
 
-        # Build actor loss.
         act_n = act_ph_n.copy()
-        act_n[agent_id] = act_sampler
+        act_n[agent_id] = actor_output
         critic, _, _, _ = self._build_critic_network(
             obs_ph_n,
             act_n,
@@ -179,10 +195,12 @@ class MADDPGTFPolicy(MADDPGPostprocessing, TFPolicy):
             config["critic_hiddens"],
             getattr(tf.nn, config["critic_hidden_activation"]),
             scope="critic")
+
+        # Build actor loss.
         actor_loss = -tf.reduce_mean(critic)
         if config["actor_feature_reg"] is not None:
             actor_loss += config["actor_feature_reg"] * tf.reduce_mean(
-                actor_feature**2)
+                actor_output**2)
 
         # _____ Losses
         self.losses = {"critic": critic_loss, "actor": actor_loss}
@@ -245,9 +263,12 @@ class MADDPGTFPolicy(MADDPGPostprocessing, TFPolicy):
             config=config,
             sess=self.sess,
             obs_input=obs_ph_n[agent_id],
-            sampled_action=act_sampler,
+            sampled_action=self.output_actions,
             loss=actor_loss + critic_loss,
-            loss_inputs=loss_inputs)
+            loss_inputs=loss_inputs,
+            explore=explore,
+            timestep = self.timestep,
+            )
 
         self.sess.run(tf.global_variables_initializer())
 
@@ -340,10 +361,10 @@ class MADDPGTFPolicy(MADDPGPostprocessing, TFPolicy):
 
             for hidden in hiddens:
                 out = tf.layers.dense(out, units=hidden, activation=activation)
-            feature = out
-            out = tf.layers.dense(feature, units=1, activation=None)
 
-        return out, feature, model_n, tf.global_variables(scope.name)
+            values = tf.layers.dense(out, units=1 , activation=None)
+
+        return values, out, model_n, tf.global_variables(scope.name)
 
     def _build_actor_network(self,
                              obs,
@@ -366,12 +387,26 @@ class MADDPGTFPolicy(MADDPGPostprocessing, TFPolicy):
 
             for hidden in hiddens:
                 out = tf.layers.dense(out, units=hidden, activation=activation)
+
             feature = tf.layers.dense(
                 out, units=act_space.shape[0], activation=None)
+
+            """
+
             sampler = tfp.distributions.RelaxedOneHotCategorical(
                 temperature=1.0, logits=feature).sample()
+            """
+            # Use sigmoid to scale to [0,1], but also double magnitude of input to
+            # emulate behaviour of tanh activation used in DDPG and TD3 papers.
+            sigmoid_out = tf.nn.sigmoid(2 * feature)
+            # Rescale to actual env policy scale
+            # (shape of sigmoid_out is [batch_size, dim_actions], so we reshape to
+            # get same dims)
+            action_range = (act_space.high - act_space.low)[None]
+            low_action = act_space.low[None]
+            actions = action_range * sigmoid_out + low_action
 
-        return sampler, feature, model, tf.global_variables(scope.name)
+        return actions, feature, model, tf.global_variables(scope.name)
 
     def update_target(self, tau=None):
         if tau is not None:
